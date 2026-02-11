@@ -1,0 +1,252 @@
+---
+- name: Install and configure TeamSpeak 3 server
+  hosts: teamspeak
+  become: true
+
+  vars:
+    ts_version: "3.13.7"
+    ts_user: "teamspeak"
+    ts_dir: "/opt/teamspeak"
+    ts_url: "https://files.teamspeak-services.com/releases/server/{{ ts_version }}/teamspeak3-server_linux_amd64-{{ ts_version }}.tar.bz2"
+    ts_admin_password: "{{ lookup('file', '.env') | regex_findall('TS_ADMIN_PASSWORD=(.+)') | first }}"
+    ts_password: "{{ lookup('file', '.env') | regex_findall('TS_PASSWORD=(.+)') | first }}"
+
+  handlers:
+    - name: Restart teamspeak
+      ansible.builtin.systemd:
+        name: teamspeak
+        state: restarted
+
+  tasks:
+    # ── DNS ────────────────────────────────────────────────────────────────────
+
+    - name: Set nameserver to 1.1.1.1
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: "nameserver 1.1.1.1\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    # ── System update ──────────────────────────────────────────────────────────
+
+    - name: Update apt cache and dist-upgrade
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        cache_valid_time: 0
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot if required
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+      when: reboot_required.stat.exists
+
+    # ── Dependencies ───────────────────────────────────────────────────────────
+
+    - name: Install dependencies
+      ansible.builtin.apt:
+        name:
+          - bzip2
+          - wget
+          - libmariadb3
+        state: present
+
+    # ── System user ────────────────────────────────────────────────────────────
+
+    - name: Create teamspeak system user
+      ansible.builtin.user:
+        name: "{{ ts_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ ts_dir }}"
+        create_home: false
+        comment: "TeamSpeak 3 server"
+
+    # ── Download & extract ─────────────────────────────────────────────────────
+
+    - name: Check if TeamSpeak binary already exists
+      ansible.builtin.stat:
+        path: "{{ ts_dir }}/ts3server"
+      register: ts_binary
+
+    - name: Create install directory
+      ansible.builtin.file:
+        path: "{{ ts_dir }}"
+        state: directory
+        owner: "{{ ts_user }}"
+        group: "{{ ts_user }}"
+        mode: "0750"
+      when: not ts_binary.stat.exists
+
+    - name: Download TeamSpeak 3 server archive
+      ansible.builtin.get_url:
+        url: "{{ ts_url }}"
+        dest: "/tmp/teamspeak3-server_linux_amd64-{{ ts_version }}.tar.bz2"
+        mode: "0600"
+      when: not ts_binary.stat.exists
+
+    - name: Extract TeamSpeak 3 server archive
+      ansible.builtin.unarchive:
+        src: "/tmp/teamspeak3-server_linux_amd64-{{ ts_version }}.tar.bz2"
+        dest: "{{ ts_dir }}"
+        remote_src: true
+        extra_opts:
+          - "--strip-components=1"
+        owner: "{{ ts_user }}"
+        group: "{{ ts_user }}"
+      when: not ts_binary.stat.exists
+
+    - name: Remove archive
+      ansible.builtin.file:
+        path: "/tmp/teamspeak3-server_linux_amd64-{{ ts_version }}.tar.bz2"
+        state: absent
+      when: not ts_binary.stat.exists
+
+    # ── License ────────────────────────────────────────────────────────────────
+
+    - name: Accept TeamSpeak license
+      ansible.builtin.file:
+        path: "{{ ts_dir }}/.ts3server_license_accepted"
+        state: touch
+        owner: "{{ ts_user }}"
+        group: "{{ ts_user }}"
+        mode: "0644"
+        modification_time: preserve
+        access_time: preserve
+
+    # ── Configuration ──────────────────────────────────────────────────────────
+
+    - name: Deploy ts3server.ini
+      ansible.builtin.copy:
+        dest: "{{ ts_dir }}/ts3server.ini"
+        owner: "{{ ts_user }}"
+        group: "{{ ts_user }}"
+        mode: "0640"
+        content: |
+          serveradmin_password={{ ts_admin_password }}
+      notify: Restart teamspeak
+
+    # ── systemd service ────────────────────────────────────────────────────────
+
+    - name: Deploy systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/teamspeak.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=TeamSpeak 3 Server
+          After=network.target
+
+          [Service]
+          Type=forking
+          User={{ ts_user }}
+          Group={{ ts_user }}
+          WorkingDirectory={{ ts_dir }}
+          ExecStart={{ ts_dir }}/ts3server_startscript.sh start inifile=ts3server.ini
+          ExecStop={{ ts_dir }}/ts3server_startscript.sh stop
+          ExecReload={{ ts_dir }}/ts3server_startscript.sh restart
+          PIDFile={{ ts_dir }}/ts3server.pid
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart teamspeak
+
+    - name: Enable and start TeamSpeak service
+      ansible.builtin.systemd:
+        name: teamspeak
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ── Virtual server password ────────────────────────────────────────────────
+
+    - name: Set virtual server join password via ServerQuery
+      ansible.builtin.shell:
+        cmd: |
+          python3 - <<'EOF'
+          import socket, sys
+
+          s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          s.connect(('127.0.0.1', 10011))
+          s.settimeout(5)
+
+          def recv_until(sock, marker=b'error id='):
+              buf = b''
+              while marker not in buf:
+                  buf += sock.recv(4096)
+              return buf
+
+          def send_cmd(sock, cmd):
+              sock.sendall((cmd + '\n').encode())
+              resp = recv_until(sock)
+              if b'error id=0' not in resp:
+                  print(resp.decode(), file=sys.stderr)
+                  sys.exit(1)
+
+          recv_until(s, b'TS3')  # banner
+          send_cmd(s, 'login serveradmin {{ ts_admin_password }}')
+          send_cmd(s, 'use 1')
+          send_cmd(s, 'serveredit virtualserver_password={{ ts_password }}')
+          send_cmd(s, 'quit')
+          s.close()
+          EOF
+      changed_when: false
+
+    # ── Firewall ───────────────────────────────────────────────────────────────
+
+    - name: Gather package facts
+      ansible.builtin.package_facts:
+        manager: apt
+
+    - name: Open TeamSpeak firewall ports
+      when: "'ufw' in ansible_facts.packages"
+      block:
+        - name: Allow voice port 9987/udp
+          community.general.ufw:
+            rule: allow
+            port: "9987"
+            proto: udp
+
+        - name: Allow ServerQuery port 10011/tcp
+          community.general.ufw:
+            rule: allow
+            port: "10011"
+            proto: tcp
+
+        - name: Allow file transfer port 30033/tcp
+          community.general.ufw:
+            rule: allow
+            port: "30033"
+            proto: tcp
+
+    # ── Admin token ────────────────────────────────────────────────────────────
+
+    - name: Wait for admin token in logs
+      ansible.builtin.command:
+        cmd: >
+          grep -r "token=" {{ ts_dir }}/logs/
+      register: ts_token_grep
+      retries: 10
+      delay: 5
+      until: ts_token_grep.rc == 0
+      changed_when: false
+      failed_when: ts_token_grep.rc != 0
+
+    - name: Display initial server admin token
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ts_token_grep.stdout_lines
+            | select('search', 'token=')
+            | map('regex_replace', '^.*token=(\S+).*$', '\1')
+            | first
+          }}
