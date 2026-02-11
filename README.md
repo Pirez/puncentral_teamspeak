@@ -8,6 +8,15 @@ Ansible playbook to deploy a TeamSpeak 3 server on Ubuntu 24.04.
 ansible-galaxy collection install community.general
 ```
 
+## Inventory
+
+Create an `inventory.ini` (gitignored):
+
+```ini
+[teamspeak]
+1.2.3.4 ansible_user=root
+```
+
 ## Usage
 
 ```bash
