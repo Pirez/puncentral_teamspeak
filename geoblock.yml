@@ -1,0 +1,225 @@
+---
+# geoblock.yml - Allow only Norwegian IPs (IPv4)
+# Usage: ansible-playbook geoblock.yml -i inventory
+#
+# WARNING: This will block ALL non-Norwegian traffic.
+#          Make sure you're connecting from a Norwegian IP before running.
+
+- name: Geoblock - Allow only Norwegian IPs
+  hosts: all
+  become: true
+
+  vars:
+    geoip_zone_url: "https://www.ipdeny.com/ipblocks/data/countries/no.zone"
+    geoip_dir: "/etc/geoip"
+    geoip_zone_file: "{{ geoip_dir }}/no.zone"
+    ipset_name: "norway"
+    geoip_update_script: "/usr/local/bin/update-geoip.sh"
+    geoip_cron_schedule:
+      minute: "0"
+      hour: "3"
+      weekday: "0"  # Sunday
+
+  tasks:
+    # ── Disable UFW ───────────────────────────────────────────────
+    # UFW and raw iptables both manage the INPUT chain. Flushing INPUT
+    # later removes UFW's jump rules, leaving its port rules unreachable.
+    # Disable UFW so geoblock owns the firewall exclusively.
+    - name: Gather package facts
+      package_facts:
+        manager: apt
+
+    - name: Disable UFW if active (geoblock takes over firewall management)
+      community.general.ufw:
+        state: disabled
+      when: "'ufw' in ansible_facts.packages"
+
+    # ── Dependencies ──────────────────────────────────────────────
+    - name: Install required packages
+      apt:
+        name:
+          - ipset
+          - iptables
+          - iptables-persistent
+          - netfilter-persistent
+          - wget
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # ── GeoIP data ────────────────────────────────────────────────
+    - name: Create GeoIP directory
+      file:
+        path: "{{ geoip_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download Norwegian IP zone file
+      get_url:
+        url: "{{ geoip_zone_url }}"
+        dest: "{{ geoip_zone_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+      register: zone_download
+
+    # ── ipset ─────────────────────────────────────────────────────
+    - name: Check if ipset exists
+      command: ipset list {{ ipset_name }}
+      register: ipset_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create ipset if it does not exist
+      command: ipset create {{ ipset_name }} hash:net
+      when: ipset_check.rc != 0
+
+    - name: Flush ipset before repopulating
+      command: ipset flush {{ ipset_name }}
+      when: zone_download.changed or ipset_check.rc != 0
+
+    - name: Populate ipset with Norwegian IP ranges
+      shell: |
+        while IFS= read -r cidr; do
+          [ -z "$cidr" ] && continue
+          ipset add {{ ipset_name }} "$cidr" 2>/dev/null || true
+        done < {{ geoip_zone_file }}
+      args:
+        executable: /bin/bash
+      when: zone_download.changed or ipset_check.rc != 0
+
+    - name: Save ipset to disk
+      shell: ipset save > /etc/ipset.conf
+      changed_when: true
+
+    # ── ipset restore on boot ─────────────────────────────────────
+    - name: Create ipset restore systemd service
+      copy:
+        dest: /etc/systemd/system/ipset-restore.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Restore ipset rules
+          Before=netfilter-persistent.service
+          Before=iptables.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/ipset restore -f /etc/ipset.conf
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    - name: Enable ipset restore service
+      systemd:
+        name: ipset-restore
+        enabled: true
+
+    # ── iptables rules ────────────────────────────────────────────
+    - name: Flush iptables INPUT chain
+      iptables:
+        chain: INPUT
+        flush: true
+
+    - name: Allow loopback traffic
+      iptables:
+        chain: INPUT
+        in_interface: lo
+        jump: ACCEPT
+        comment: "Allow loopback"
+
+    - name: Allow established and related connections
+      iptables:
+        chain: INPUT
+        ctstate:
+          - ESTABLISHED
+          - RELATED
+        jump: ACCEPT
+        comment: "Allow established/related"
+
+    - name: Allow Norwegian IPs (ipset match)
+      iptables:
+        chain: INPUT
+        match_set: "{{ ipset_name }}"
+        match_set_flags: src
+        jump: ACCEPT
+        comment: "Allow Norwegian IPs"
+
+    - name: Drop all other traffic
+      iptables:
+        chain: INPUT
+        jump: DROP
+        comment: "Drop non-Norwegian traffic"
+
+    - name: Save iptables rules
+      command: netfilter-persistent save
+      changed_when: true
+
+    # ── Auto-update cron ──────────────────────────────────────────
+    - name: Deploy GeoIP update script
+      copy:
+        dest: "{{ geoip_update_script }}"
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+
+          ZONE_FILE="{{ geoip_zone_file }}"
+          IPSET_NAME="{{ ipset_name }}"
+          TMP_FILE=$(mktemp)
+
+          # Download fresh zone data
+          if ! wget -q "{{ geoip_zone_url }}" -O "$TMP_FILE"; then
+            echo "ERROR: Failed to download zone file" >&2
+            rm -f "$TMP_FILE"
+            exit 1
+          fi
+
+          # Validate: file should have at least 100 entries
+          LINES=$(wc -l < "$TMP_FILE")
+          if [ "$LINES" -lt 100 ]; then
+            echo "ERROR: Zone file suspiciously small ($LINES lines), aborting" >&2
+            rm -f "$TMP_FILE"
+            exit 1
+          fi
+
+          # Swap in new zone file
+          mv "$TMP_FILE" "$ZONE_FILE"
+
+          # Rebuild ipset using swap strategy (no downtime)
+          ipset create "${IPSET_NAME}_tmp" hash:net 2>/dev/null || ipset flush "${IPSET_NAME}_tmp"
+          while IFS= read -r cidr; do
+            [ -z "$cidr" ] && continue
+            ipset add "${IPSET_NAME}_tmp" "$cidr" 2>/dev/null || true
+          done < "$ZONE_FILE"
+
+          ipset swap "${IPSET_NAME}_tmp" "$IPSET_NAME"
+          ipset destroy "${IPSET_NAME}_tmp"
+
+          # Persist
+          ipset save > /etc/ipset.conf
+
+          echo "GeoIP updated: $LINES Norwegian IP ranges loaded"
+
+    - name: Schedule weekly GeoIP update
+      cron:
+        name: "Update GeoIP Norwegian IP ranges"
+        minute: "{{ geoip_cron_schedule.minute }}"
+        hour: "{{ geoip_cron_schedule.hour }}"
+        weekday: "{{ geoip_cron_schedule.weekday }}"
+        user: root
+        job: "{{ geoip_update_script }} >> /var/log/geoip-update.log 2>&1"
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: true

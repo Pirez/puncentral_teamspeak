@@ -1,0 +1,294 @@
+---
+# monitor.yml — GoAccess log monitoring + Fail2Ban intrusion prevention
+#
+# Usage:
+#   ansible-playbook monitor.yml
+#   ansible-playbook monitor.yml --tags monitoring-fail2ban
+#   ansible-playbook monitor.yml --tags monitoring-verify
+#
+# Access GoAccess report via SSH tunnel:
+#   ssh -L 8080:127.0.0.1:8080 user@server
+#   Then open: http://localhost:8080
+
+- name: Configure GoAccess monitoring and Fail2Ban protection
+  hosts: all
+  become: true
+
+  vars:
+    ssh_port: 22
+    ts_dir: /opt/teamspeak              # Must match teamspeak.yml
+
+    goaccess_report_path: /var/www/html/goaccess
+    goaccess_report_minute: "5"         # Run at HH:05 every hour
+
+    fail2ban_bantime: "1h"
+    fail2ban_findtime: "10m"
+    fail2ban_maxretry: 5
+    fail2ban_ignoreip: "127.0.0.1/8 ::1"  # Add your own IP here
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+      listen: reload nginx
+
+    - name: Restart fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: restarted
+      listen: restart fail2ban
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Packages
+    # -------------------------------------------------------------------------
+    - name: Install nginx, GoAccess, and Fail2Ban
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - goaccess
+          - fail2ban
+        state: present
+        update_cache: true
+      # Include all functional tags so packages are installed regardless of which
+      # tag subset is used (e.g. --tags monitoring-fail2ban must not skip this)
+      tags:
+        - monitoring-install
+        - monitoring-nginx
+        - monitoring-goaccess
+        - monitoring-fail2ban
+
+    # -------------------------------------------------------------------------
+    # Nginx — serves GoAccess HTML report on localhost only.
+    # Never exposed publicly; reach it via: ssh -L 8080:127.0.0.1:8080 user@server
+    # -------------------------------------------------------------------------
+    - name: Create GoAccess report directory
+      ansible.builtin.file:
+        path: "{{ goaccess_report_path }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+      tags:
+        - monitoring-nginx
+        - monitoring-goaccess
+
+    - name: Deploy nginx site for GoAccess report
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/goaccess
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 127.0.0.1:8080;
+              server_name _;
+
+              root {{ goaccess_report_path }};
+              index index.html;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+          }
+      notify: reload nginx
+      tags: monitoring-nginx
+
+    - name: Enable GoAccess nginx site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/goaccess
+        dest: /etc/nginx/sites-enabled/goaccess
+        state: link
+      notify: reload nginx
+      tags: monitoring-nginx
+
+    - name: Disable nginx default site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+      tags: monitoring-nginx
+
+    - name: Enable and start nginx
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: true
+        state: started
+      tags: monitoring-nginx
+
+    # -------------------------------------------------------------------------
+    # GoAccess — hourly static HTML report from nginx access logs
+    # -------------------------------------------------------------------------
+    - name: Deploy GoAccess report generation script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/generate-goaccess-report.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Generate a GoAccess HTML report from all nginx access logs.
+          # Combines current log with rotated/compressed logs for full history.
+          set -euo pipefail
+
+          OUTPUT="{{ goaccess_report_path }}/index.html"
+          TMPFILE=$(mktemp --suffix=.html)
+          trap 'rm -f "$TMPFILE"' EXIT
+          {% raw %}
+          LOG_FILES=()
+          for f in /var/log/nginx/access.log /var/log/nginx/access.log.1; do
+              [ -f "$f" ] && LOG_FILES+=("$f")
+          done
+          # Include any gzip-rotated logs
+          for f in /var/log/nginx/access.log.*.gz; do
+              [ -f "$f" ] && LOG_FILES+=("$f")
+          done
+
+          if [ ${#LOG_FILES[@]} -eq 0 ]; then
+              echo "No nginx log files found, skipping report generation." >&2
+              exit 0
+          fi
+
+          zcat -f "${LOG_FILES[@]}" | \
+              goaccess - \
+                  --log-format=COMBINED \
+                  --date-format='%d/%b/%Y' \
+                  --time-format='%H:%M:%S' \
+                  --output="$TMPFILE" \
+                  --no-global-config \
+                  --real-os || true
+          {% endraw %}
+          mv "$TMPFILE" "$OUTPUT"
+          chown www-data:www-data "$OUTPUT"
+      tags: monitoring-goaccess
+
+    - name: Generate initial GoAccess report
+      ansible.builtin.command: /usr/local/bin/generate-goaccess-report.sh
+      args:
+        creates: "{{ goaccess_report_path }}/index.html"
+      tags: monitoring-goaccess
+
+    - name: Schedule hourly GoAccess report generation
+      ansible.builtin.cron:
+        name: Generate GoAccess report
+        minute: "{{ goaccess_report_minute }}"
+        user: root
+        job: /usr/local/bin/generate-goaccess-report.sh
+        state: present
+      tags: monitoring-goaccess
+
+    # -------------------------------------------------------------------------
+    # Fail2Ban — TeamSpeak custom filter
+    #
+    # Matches TS3 WARNING log lines for rejected clients and flooding.
+    # Example log line:
+    #   2024-01-15 10:30:00|WARNING |VirtualServer |1  | client rejected 'nick' (1.2.3.4:5678) ...
+    # -------------------------------------------------------------------------
+    - name: Deploy TeamSpeak Fail2Ban filter
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/filter.d/teamspeak.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Definition]
+          failregex = ^.*\|WARNING\s*\|VirtualServer\s*\|.*\|\s*client rejected '.*' \(<HOST>:\d+\).*$
+                      ^.*\|WARNING\s*\|VirtualServer\s*\|.*\|\s*flooding detected from <HOST>.*$
+          ignoreregex =
+      notify: restart fail2ban
+      tags: monitoring-fail2ban
+
+    # -------------------------------------------------------------------------
+    # Fail2Ban — jail configuration
+    #
+    # No banaction override — uses fail2ban's built-in default (iptables-multiport),
+    # which works on Ubuntu 24.04 via the iptables-nft compatibility layer.
+    # TeamSpeak bans the entire IP since attacks span UDP + TCP.
+    # -------------------------------------------------------------------------
+    - name: Deploy Fail2Ban jail configuration
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/local.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [DEFAULT]
+          bantime   = {{ fail2ban_bantime }}
+          findtime  = {{ fail2ban_findtime }}
+          maxretry  = {{ fail2ban_maxretry }}
+          ignoreip  = {{ fail2ban_ignoreip }}
+
+          [sshd]
+          enabled  = true
+          port     = {{ ssh_port }}
+          logpath  = %(sshd_log)s
+          backend  = %(sshd_backend)s
+          maxretry = 3
+
+          [nginx-http-auth]
+          enabled  = true
+          logpath  = /var/log/nginx/error.log
+
+          [nginx-botsearch]
+          enabled  = true
+          logpath  = /var/log/nginx/access.log
+          maxretry = 2
+
+          [teamspeak]
+          enabled     = true
+          filter      = teamspeak
+          logpath     = {{ ts_dir }}/logs/ts3server_*.log
+          # Ban the entire IP — TS3 attacks span both UDP (9987) and TCP (10011, 30033)
+          banaction   = iptables-allports
+          maxretry    = {{ fail2ban_maxretry }}
+      notify: restart fail2ban
+      tags: monitoring-fail2ban
+
+    - name: Enable and start Fail2Ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        enabled: true
+        state: started
+      tags: monitoring-fail2ban
+
+    # -------------------------------------------------------------------------
+    # Verify
+    # -------------------------------------------------------------------------
+    - name: Check Fail2Ban jail status
+      ansible.builtin.command: fail2ban-client status
+      register: fail2ban_status
+      changed_when: false
+      failed_when: false
+      tags: monitoring-verify
+
+    - name: Print Fail2Ban jail status
+      ansible.builtin.debug:
+        msg: "{{ fail2ban_status.stdout_lines if fail2ban_status.rc == 0 else fail2ban_status.stderr_lines }}"
+      tags: monitoring-verify
+
+    - name: Print Fail2Ban service journal (last 20 lines) on failure
+      ansible.builtin.command: journalctl -u fail2ban --no-pager -n 20
+      register: fail2ban_journal
+      changed_when: false
+      failed_when: false
+      when: fail2ban_status.rc != 0
+      tags: monitoring-verify
+
+    - name: Show Fail2Ban journal
+      ansible.builtin.debug:
+        msg: "{{ fail2ban_journal.stdout_lines }}"
+      when: fail2ban_status.rc != 0
+      tags: monitoring-verify
+
+    - name: Verify nginx config
+      ansible.builtin.command: nginx -t
+      register: nginx_test
+      changed_when: false
+      tags: monitoring-verify
+
+    - name: Print nginx config test result
+      ansible.builtin.debug:
+        msg: "{{ nginx_test.stderr_lines }}"
+      tags: monitoring-verify
