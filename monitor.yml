@@ -24,7 +24,9 @@
     fail2ban_bantime: "1h"
     fail2ban_findtime: "10m"
     fail2ban_maxretry: 5
-    fail2ban_ignoreip: "127.0.0.1/8 ::1"  # Add your own IP here
+    fail2ban_ignoreip: "127.0.0.1/8 ::1"
+    # Set fail2ban_admin_ip to your static IP to prevent accidental lockout (e.g. "1.2.3.4")
+    fail2ban_admin_ip: ""
 
   handlers:
     - name: Reload nginx
@@ -218,7 +220,7 @@
           bantime   = {{ fail2ban_bantime }}
           findtime  = {{ fail2ban_findtime }}
           maxretry  = {{ fail2ban_maxretry }}
-          ignoreip  = {{ fail2ban_ignoreip }}
+          ignoreip  = {{ fail2ban_ignoreip }}{% if fail2ban_admin_ip %} {{ fail2ban_admin_ip }}{% endif %}
 
           [sshd]
           enabled  = true

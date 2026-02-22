@@ -17,16 +17,30 @@
         name: teamspeak
         state: restarted
 
+    - name: Restart systemd-resolved
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+        enabled: true
+
   tasks:
     # ── DNS ────────────────────────────────────────────────────────────────────
 
-    - name: Set nameserver to 1.1.1.1
-      ansible.builtin.copy:
-        dest: /etc/resolv.conf
-        content: "nameserver 1.1.1.1\n"
-        owner: root
-        group: root
-        mode: "0644"
+    - name: Configure primary DNS server in systemd-resolved
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/resolved.conf
+        regexp: '^#?DNS='
+        line: 'DNS=1.1.1.1'
+        insertafter: '^\[Resolve\]'
+      notify: Restart systemd-resolved
+
+    - name: Configure fallback DNS server in systemd-resolved
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/resolved.conf
+        regexp: '^#?FallbackDNS='
+        line: 'FallbackDNS=8.8.8.8'
+        insertafter: '^\[Resolve\]'
+      notify: Restart systemd-resolved
 
     # ── System update ──────────────────────────────────────────────────────────
 
@@ -169,11 +183,15 @@
 
     # ── Virtual server password ────────────────────────────────────────────────
 
-    - name: Set virtual server join password via ServerQuery
-      ansible.builtin.shell:
-        cmd: |
-          python3 - <<'EOF'
-          import socket, sys
+    - name: Write ServerQuery script to temporary file
+      ansible.builtin.copy:
+        dest: /tmp/ts3_setpw.py
+        owner: root
+        group: root
+        mode: "0700"
+        content: |
+          #!/usr/bin/env python3
+          import socket, sys, os
 
           s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           s.connect(('127.0.0.1', 10011))
@@ -192,14 +210,28 @@
                   print(resp.decode(), file=sys.stderr)
                   sys.exit(1)
 
+          admin_password = os.environ['TS_ADMIN_PASSWORD']
+          server_password = os.environ['TS_PASSWORD']
+
           recv_until(s, b'TS3')  # banner
-          send_cmd(s, 'login serveradmin {{ ts_admin_password }}')
+          send_cmd(s, f'login serveradmin {admin_password}')
           send_cmd(s, 'use 1')
-          send_cmd(s, 'serveredit virtualserver_password={{ ts_password }}')
+          send_cmd(s, f'serveredit virtualserver_password={server_password}')
           send_cmd(s, 'quit')
           s.close()
-          EOF
+
+    - name: Set virtual server join password via ServerQuery
+      ansible.builtin.command:
+        cmd: /tmp/ts3_setpw.py
+      environment:
+        TS_ADMIN_PASSWORD: "{{ ts_admin_password }}"
+        TS_PASSWORD: "{{ ts_password }}"
       changed_when: false
+
+    - name: Remove ServerQuery script temporary file
+      ansible.builtin.file:
+        path: /tmp/ts3_setpw.py
+        state: absent
 
     # ── Firewall ───────────────────────────────────────────────────────────────
 
@@ -215,12 +247,6 @@
             rule: allow
             port: "9987"
             proto: udp
-
-        - name: Allow ServerQuery port 10011/tcp
-          community.general.ufw:
-            rule: allow
-            port: "10011"
-            proto: tcp
 
         - name: Allow file transfer port 30033/tcp
           community.general.ufw:
