@@ -25,6 +25,10 @@
       - ncdu
       - nethogs
 
+    # Security tools
+    security_packages:
+      - unattended-upgrades
+
   tasks:
     # ── Package Installation ──────────────────────────────────────────────────
     # Development tools for building from source + monitoring utilities
@@ -47,6 +51,26 @@
       ansible.builtin.apt:
         name: "{{ monitoring_packages }}"
         state: present
+      tags:
+        - defaults-packages
+
+    - name: Install security tools
+      ansible.builtin.apt:
+        name: "{{ security_packages }}"
+        state: present
+      tags:
+        - defaults-packages
+
+    - name: Enable unattended-upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::AutocleanInterval "7";
       tags:
         - defaults-packages
 
@@ -290,5 +314,26 @@
     - name: Print monitoring packages status
       ansible.builtin.debug:
         msg: "Monitoring packages: {{ 'Installed' if mon_pkg_list.rc == 0 else 'Some packages missing' }}"
+      tags:
+        - defaults-verify
+
+    - name: Verify unattended-upgrades configuration
+      ansible.builtin.stat:
+        path: /etc/apt/apt.conf.d/20auto-upgrades
+      register: unattended_config
+      tags:
+        - defaults-verify
+
+    - name: Check unattended-upgrades service status
+      ansible.builtin.systemd:
+        name: unattended-upgrades
+      register: unattended_service
+      failed_when: false
+      tags:
+        - defaults-verify
+
+    - name: Print unattended-upgrades status
+      ansible.builtin.debug:
+        msg: "Unattended-upgrades: {{ 'Configured' if unattended_config.stat.exists else 'NOT configured' }}"
       tags:
         - defaults-verify

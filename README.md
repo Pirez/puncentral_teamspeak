@@ -35,7 +35,7 @@ ansible-playbook -i inventory.ini defaults.yml
 - **Oh My Bash**: Enhanced shell with themes, plugins, and custom aliases
 - **Vim config**: Minimal sensible defaults (~20 lines)
 - **MOTD**: Custom welcome message with system info, TeamSpeak status, and security warnings
-- **Packages**: Development tools (build-essential, git, curl, wget, make, gcc) + monitoring tools (htop, iotop, ncdu, nethogs)
+- **Packages**: Development tools (build-essential, git, curl, wget, make, gcc) + monitoring tools (htop, iotop, ncdu, nethogs) + security (unattended-upgrades)
 
 Run specific components:
 
