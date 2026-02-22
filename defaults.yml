@@ -1,0 +1,294 @@
+---
+- name: Configure server quality-of-life improvements
+  hosts: all
+  become: true
+
+  vars:
+    # Oh My Bash
+    omb_install_dir: /root/.oh-my-bash
+    omb_theme: font  # Clean, minimal theme
+
+    # Development tools
+    dev_packages:
+      - build-essential
+      - git
+      - curl
+      - wget
+      - unzip
+      - make
+      - gcc
+
+    # Monitoring tools
+    monitoring_packages:
+      - htop
+      - iotop
+      - ncdu
+      - nethogs
+
+  tasks:
+    # ── Package Installation ──────────────────────────────────────────────────
+    # Development tools for building from source + monitoring utilities
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      tags:
+        - defaults-packages
+
+    - name: Install development tools
+      ansible.builtin.apt:
+        name: "{{ dev_packages }}"
+        state: present
+      tags:
+        - defaults-packages
+
+    - name: Install monitoring tools
+      ansible.builtin.apt:
+        name: "{{ monitoring_packages }}"
+        state: present
+      tags:
+        - defaults-packages
+
+    # ── Oh My Bash Configuration ──────────────────────────────────────────────
+    # Enhanced bash shell with themes, plugins, and aliases
+
+    - name: Check if Oh My Bash is already installed
+      ansible.builtin.stat:
+        path: "{{ omb_install_dir }}"
+      register: omb_stat
+      tags:
+        - defaults-bash
+
+    - name: Clone Oh My Bash repository
+      ansible.builtin.git:
+        repo: https://github.com/ohmybash/oh-my-bash.git
+        dest: "{{ omb_install_dir }}"
+        depth: 1
+        version: master
+      when: not omb_stat.stat.exists
+      tags:
+        - defaults-bash
+
+    - name: Deploy Oh My Bash configuration
+      ansible.builtin.copy:
+        dest: /root/.bashrc
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Path to Oh My Bash installation
+          export OSH="{{ omb_install_dir }}"
+
+          # Theme
+          OSH_THEME="{{ omb_theme }}"
+
+          # Plugins
+          plugins=(git bashmarks)
+
+          # Enable Oh My Bash
+          source "$OSH/oh-my-bash.sh"
+
+          # Custom aliases
+          alias ll='ls -lah'
+          alias ts-logs='tail -f /opt/teamspeak/logs/ts3server_*.log'
+          alias ts-status='systemctl status teamspeak'
+      when: not omb_stat.stat.exists
+      tags:
+        - defaults-bash
+
+    # ── Vim Configuration ─────────────────────────────────────────────────────
+    # Minimal sensible defaults for server-side editing
+
+    - name: Deploy .vimrc
+      ansible.builtin.copy:
+        dest: /root/.vimrc
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          " Sensible vim defaults for server administration
+          syntax on                      " Enable syntax highlighting
+          set number                     " Show line numbers
+          set ruler                      " Show cursor position
+          set showcmd                    " Show command in status line
+          set showmatch                  " Highlight matching brackets
+          set ignorecase                 " Case-insensitive search
+          set smartcase                  " Override ignorecase if uppercase used
+          set incsearch                  " Incremental search
+          set hlsearch                   " Highlight search results
+          set autoindent                 " Auto-indent new lines
+          set smartindent                " Smart indentation
+          set tabstop=4                  " Tab width
+          set shiftwidth=4               " Indent width
+          set expandtab                  " Use spaces instead of tabs
+          set mouse=a                    " Enable mouse support
+          set clipboard=unnamed          " Use system clipboard
+          set noswapfile                 " Disable swap files
+          set nobackup                   " Disable backup files
+          set history=1000               " Command history
+      tags:
+        - defaults-vim
+
+    # ── MOTD Configuration ────────────────────────────────────────────────────
+    # Custom welcome message with system info and TeamSpeak status
+
+    - name: Disable default Ubuntu MOTD scripts
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0644"  # Remove execute bit
+      loop:
+        - /etc/update-motd.d/00-header
+        - /etc/update-motd.d/10-help-text
+        - /etc/update-motd.d/50-motd-news
+        - /etc/update-motd.d/88-esm-announce
+        - /etc/update-motd.d/90-updates-available
+        - /etc/update-motd.d/91-release-upgrade
+        - /etc/update-motd.d/92-unattended-upgrades
+        - /etc/update-motd.d/95-hwe-eol
+      failed_when: false  # Some scripts may not exist
+      tags:
+        - defaults-motd
+
+    - name: Deploy custom MOTD script
+      ansible.builtin.copy:
+        dest: /etc/update-motd.d/99-custom
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Custom MOTD - System info, TeamSpeak status, Security warnings
+
+          # Colors
+          CYAN='\033[0;36m'
+          GREEN='\033[0;32m'
+          YELLOW='\033[1;33m'
+          RED='\033[0;31m'
+          NC='\033[0m'
+
+          echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+          echo -e "${GREEN}  TeamSpeak 3 Server - $(hostname)${NC}"
+          echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+          # System Info
+          echo -e "\n${CYAN}[System]${NC}"
+          echo "  Uptime      : $(uptime -p)"
+          echo "  Load Avg    : $(uptime | awk -F'load average:' '{print $2}')"
+          MEM_USED=$(free -h | awk '/^Mem:/ {print $3}')
+          MEM_TOTAL=$(free -h | awk '/^Mem:/ {print $2}')
+          MEM_PERCENT=$(free | awk '/^Mem:/ {printf "%.0f%%", $3/$2*100}')
+          echo "  Memory      : $MEM_USED / $MEM_TOTAL ($MEM_PERCENT)"
+          echo "  Disk (root) : $(df -h / | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')"
+
+          # TeamSpeak Status
+          echo -e "\n${CYAN}[TeamSpeak]${NC}"
+          if systemctl is-active --quiet teamspeak 2>/dev/null; then
+              echo -e "  Status      : ${GREEN}Running${NC}"
+              TS_PID=$(systemctl show -p MainPID --value teamspeak 2>/dev/null)
+              if [ "$TS_PID" != "0" ] && [ -n "$TS_PID" ]; then
+                  echo "  Process     : PID $TS_PID"
+                  MEM_KB=$(ps -p $TS_PID -o rss= 2>/dev/null || echo "0")
+                  MEM_MB=$(awk "BEGIN {printf \"%.0f\", $MEM_KB/1024}")
+                  echo "  Memory      : ${MEM_MB} MB"
+              fi
+          else
+              echo -e "  Status      : ${RED}Not Running${NC}"
+          fi
+
+          # Security Warnings
+          echo -e "\n${CYAN}[Security]${NC}"
+          if command -v fail2ban-client &>/dev/null; then
+              BANNED=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed -r 's/.*:\s+//' | tr -d '\n')
+              if [ -n "$BANNED" ]; then
+                  echo -e "  Fail2Ban    : ${GREEN}Active${NC} (jails: $BANNED)"
+              else
+                  echo -e "  Fail2Ban    : ${YELLOW}Installed but no jails${NC}"
+              fi
+          else
+              echo -e "  Fail2Ban    : ${RED}Not installed${NC}"
+          fi
+
+          # Check firewall
+          if systemctl is-active --quiet ufw 2>/dev/null; then
+              echo -e "  Firewall    : ${GREEN}UFW Active${NC}"
+          elif iptables -L INPUT -n 2>/dev/null | grep -q "ipset"; then
+              echo -e "  Firewall    : ${GREEN}Geoblock Active${NC}"
+          else
+              echo -e "  Firewall    : ${YELLOW}Status Unknown${NC}"
+          fi
+
+          echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+      tags:
+        - defaults-motd
+
+    # ── Verification ──────────────────────────────────────────────────────────
+
+    - name: Verify Oh My Bash installation
+      ansible.builtin.stat:
+        path: "{{ omb_install_dir }}/oh-my-bash.sh"
+      register: omb_verify
+      failed_when: not omb_verify.stat.exists
+      tags:
+        - defaults-verify
+
+    - name: Print Oh My Bash status
+      ansible.builtin.debug:
+        msg: "Oh My Bash: {{ 'Installed' if omb_verify.stat.exists else 'NOT FOUND' }}"
+      tags:
+        - defaults-verify
+
+    - name: Verify vim configuration
+      ansible.builtin.command: vim -u /root/.vimrc -c 'quit'
+      register: vim_verify
+      changed_when: false
+      failed_when: vim_verify.rc != 0
+      tags:
+        - defaults-verify
+
+    - name: Print vim config status
+      ansible.builtin.debug:
+        msg: "Vim config: {{ 'Valid' if vim_verify.rc == 0 else 'INVALID' }}"
+      tags:
+        - defaults-verify
+
+    - name: Test MOTD generation
+      ansible.builtin.command: /etc/update-motd.d/99-custom
+      register: motd_test
+      changed_when: false
+      tags:
+        - defaults-verify
+
+    - name: Print MOTD preview
+      ansible.builtin.debug:
+        msg: "{{ motd_test.stdout_lines }}"
+      tags:
+        - defaults-verify
+
+    - name: List installed development packages
+      ansible.builtin.command: dpkg -l {{ dev_packages | join(' ') }}
+      register: dev_pkg_list
+      changed_when: false
+      failed_when: false
+      tags:
+        - defaults-verify
+
+    - name: Print development packages status
+      ansible.builtin.debug:
+        msg: "Development packages: {{ 'Installed' if dev_pkg_list.rc == 0 else 'Some packages missing' }}"
+      tags:
+        - defaults-verify
+
+    - name: List installed monitoring packages
+      ansible.builtin.command: dpkg -l {{ monitoring_packages | join(' ') }}
+      register: mon_pkg_list
+      changed_when: false
+      failed_when: false
+      tags:
+        - defaults-verify
+
+    - name: Print monitoring packages status
+      ansible.builtin.debug:
+        msg: "Monitoring packages: {{ 'Installed' if mon_pkg_list.rc == 0 else 'Some packages missing' }}"
+      tags:
+        - defaults-verify

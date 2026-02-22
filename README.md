@@ -23,6 +23,30 @@ Create an `inventory.ini` (gitignored):
 ansible-playbook -i inventory.ini teamspeak.yml
 ```
 
+## Server defaults (optional)
+
+Quality-of-life improvements for server administration.
+
+```bash
+ansible-playbook -i inventory.ini defaults.yml
+```
+
+**Includes:**
+- **Oh My Bash**: Enhanced shell with themes, plugins, and custom aliases
+- **Vim config**: Minimal sensible defaults (~20 lines)
+- **MOTD**: Custom welcome message with system info, TeamSpeak status, and security warnings
+- **Packages**: Development tools (build-essential, git, curl, wget, make, gcc) + monitoring tools (htop, iotop, ncdu, nethogs)
+
+Run specific components:
+
+```bash
+ansible-playbook -i inventory.ini defaults.yml --tags defaults-packages
+ansible-playbook -i inventory.ini defaults.yml --tags defaults-bash
+ansible-playbook -i inventory.ini defaults.yml --tags defaults-vim
+ansible-playbook -i inventory.ini defaults.yml --tags defaults-motd
+ansible-playbook -i inventory.ini defaults.yml --tags defaults-verify
+```
+
 ## Monitoring & security (optional)
 
 Installs GoAccess (log reports) and Fail2Ban (intrusion prevention) alongside TeamSpeak.
