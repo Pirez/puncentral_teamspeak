@@ -29,7 +29,33 @@
     security_packages:
       - unattended-upgrades
 
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+
   tasks:
+    # ── SSH Hardening ─────────────────────────────────────────────────────────
+
+    - name: Disable SSH password authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        validate: 'sshd -t -f %s'
+      notify: Restart sshd
+      tags: defaults-ssh
+
+    - name: Restrict root login to key-only
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin prohibit-password'
+        validate: 'sshd -t -f %s'
+      notify: Restart sshd
+      tags: defaults-ssh
+
     # ── Package Installation ──────────────────────────────────────────────────
     # Development tools for building from source + monitoring utilities
 
