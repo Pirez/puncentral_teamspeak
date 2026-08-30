@@ -27,6 +27,14 @@
     fail2ban_ignoreip: "127.0.0.1/8 ::1"
     # Set fail2ban_admin_ip to your static IP to prevent accidental lockout (e.g. "1.2.3.4")
     fail2ban_admin_ip: ""
+    # Set fail2ban_admin_hostname to a hostname that resolves to your IP (e.g. "vpn.bjorgen.co").
+    # A cron job will re-resolve it every 15 minutes and update all jails live — no restart needed.
+    fail2ban_admin_hostname: "vpn.bjorgen.co"
+    # Bantime escalation — doubles ban duration on each repeat offence, up to 4 weeks
+    fail2ban_bantime_increment: true
+    fail2ban_bantime_factor: 2
+    fail2ban_bantime_maxtime: "4w"
+    fail2ban_bantime_rndtime: "30m"
 
   handlers:
     - name: Reload nginx
@@ -52,6 +60,7 @@
           - nginx
           - goaccess
           - fail2ban
+          - dnsutils
         state: present
         update_cache: true
       # Include all functional tags so packages are installed regardless of which
@@ -217,10 +226,15 @@
         mode: "0644"
         content: |
           [DEFAULT]
-          bantime   = {{ fail2ban_bantime }}
-          findtime  = {{ fail2ban_findtime }}
-          maxretry  = {{ fail2ban_maxretry }}
-          ignoreip  = {{ fail2ban_ignoreip }}{% if fail2ban_admin_ip %} {{ fail2ban_admin_ip }}{% endif %}
+          bantime             = {{ fail2ban_bantime }}
+          findtime            = {{ fail2ban_findtime }}
+          maxretry            = {{ fail2ban_maxretry }}
+          ignoreip            = {{ fail2ban_ignoreip }}{% if fail2ban_admin_ip %} {{ fail2ban_admin_ip }}{% endif %}
+
+          bantime.increment   = {{ fail2ban_bantime_increment }}
+          bantime.factor      = {{ fail2ban_bantime_factor }}
+          bantime.maxtime     = {{ fail2ban_bantime_maxtime }}
+          bantime.rndtime     = {{ fail2ban_bantime_rndtime }}
 
           [sshd]
           enabled  = true
@@ -253,6 +267,79 @@
         name: fail2ban
         enabled: true
         state: started
+      tags: monitoring-fail2ban
+
+    # -------------------------------------------------------------------------
+    # Fail2Ban — dynamic admin IP updater (hostname-based whitelist)
+    # -------------------------------------------------------------------------
+    - name: Deploy admin IP updater script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/update-fail2ban-admin-ip.sh
+        owner: root
+        group: root
+        mode: "0750"
+        content: |
+          #!/bin/bash
+          # Resolves the admin hostname and updates Fail2Ban ignoreip live across all
+          # jails. Stores last known IP in a state file to avoid redundant updates.
+          set -euo pipefail
+
+          HOSTNAME="{{ fail2ban_admin_hostname }}"
+          STATE_FILE="/var/lib/fail2ban/admin-ip.state"
+
+          NEW_IP=$(dig +short "$HOSTNAME" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          if [ -z "$NEW_IP" ]; then
+              echo "$(date -Iseconds) ERROR: failed to resolve $HOSTNAME" >&2
+              exit 1
+          fi
+
+          OLD_IP=""
+          [ -f "$STATE_FILE" ] && OLD_IP=$(cat "$STATE_FILE")
+
+          if [ "$NEW_IP" = "$OLD_IP" ]; then
+              exit 0
+          fi
+
+          JAILS=$(fail2ban-client status | grep "Jail list" | sed 's/.*:\s*//' | tr ',' '\n' | tr -d ' ' | grep -v '^$')
+
+          for JAIL in $JAILS; do
+              [ -n "$OLD_IP" ] && fail2ban-client set "$JAIL" delignoreip "$OLD_IP" 2>/dev/null || true
+              fail2ban-client set "$JAIL" addignoreip "$NEW_IP"
+          done
+
+          echo "$NEW_IP" > "$STATE_FILE"
+          echo "$(date -Iseconds) Updated admin IP for $HOSTNAME: ${OLD_IP:-<none>} -> $NEW_IP"
+      when: fail2ban_admin_hostname != ""
+      tags: monitoring-fail2ban
+
+    - name: Run admin IP updater immediately
+      ansible.builtin.command: /usr/local/bin/update-fail2ban-admin-ip.sh
+      changed_when: false
+      when: fail2ban_admin_hostname != ""
+      tags: monitoring-fail2ban
+
+    - name: Schedule admin IP updater every 15 minutes
+      ansible.builtin.cron:
+        name: Update Fail2Ban admin IP
+        minute: "*/15"
+        user: root
+        job: /usr/local/bin/update-fail2ban-admin-ip.sh >> /var/log/fail2ban-admin-ip.log 2>&1
+        state: present
+      when: fail2ban_admin_hostname != ""
+      tags: monitoring-fail2ban
+
+    - name: Remove admin IP updater (hostname not configured)
+      ansible.builtin.file:
+        path: /usr/local/bin/update-fail2ban-admin-ip.sh
+        state: absent
+      when: fail2ban_admin_hostname == ""
+      tags: monitoring-fail2ban
+
+    - name: Remove admin IP updater cron (hostname not configured)
+      ansible.builtin.cron:
+        name: Update Fail2Ban admin IP
+        state: absent
+      when: fail2ban_admin_hostname == ""
       tags: monitoring-fail2ban
 
     # -------------------------------------------------------------------------
