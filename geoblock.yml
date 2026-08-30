@@ -20,6 +20,15 @@
       hour: "3"
       weekday: "0"  # Sunday
 
+    # IPv6 handling. Without this the whole geoblock is bypassable on any host
+    # with IPv6 connectivity, since ip6tables INPUT defaults to ACCEPT.
+    #   norway = mirror the IPv4 policy using ipdeny's IPv6 zone data
+    #   drop   = drop all inbound IPv6 (use if the host has no IPv6 service)
+    geoblock_ipv6_mode: "norway"
+    geoip_zone_url_v6: "https://www.ipdeny.com/ipv6/ipaddresses/blocks/no.zone"
+    geoip_zone_file_v6: "{{ geoip_dir }}/no6.zone"
+    ipset_name_v6: "norway6"
+
   tasks:
     # ── Disable UFW ───────────────────────────────────────────────
     # UFW and raw iptables both manage the INPUT chain. Flushing INPUT
@@ -66,6 +75,17 @@
         force: true
       register: zone_download
 
+    - name: Download Norwegian IPv6 zone file
+      get_url:
+        url: "{{ geoip_zone_url_v6 }}"
+        dest: "{{ geoip_zone_file_v6 }}"
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+      register: zone_download_v6
+      when: geoblock_ipv6_mode == "norway"
+
     # ── ipset ─────────────────────────────────────────────────────
     - name: Check if ipset exists
       command: ipset list {{ ipset_name }}
@@ -90,6 +110,38 @@
       args:
         executable: /bin/bash
       when: zone_download.changed or ipset_check.rc != 0
+
+    # ── ipset (IPv6) ──────────────────────────────────────────────
+    - name: Check if IPv6 ipset exists
+      command: ipset list {{ ipset_name_v6 }}
+      register: ipset_check_v6
+      changed_when: false
+      failed_when: false
+      when: geoblock_ipv6_mode == "norway"
+
+    - name: Create IPv6 ipset if it does not exist
+      command: ipset create {{ ipset_name_v6 }} hash:net family inet6
+      when:
+        - geoblock_ipv6_mode == "norway"
+        - ipset_check_v6.rc != 0
+
+    - name: Flush IPv6 ipset before repopulating
+      command: ipset flush {{ ipset_name_v6 }}
+      when:
+        - geoblock_ipv6_mode == "norway"
+        - zone_download_v6.changed or ipset_check_v6.rc != 0
+
+    - name: Populate IPv6 ipset with Norwegian IP ranges
+      shell: |
+        while IFS= read -r cidr; do
+          [ -z "$cidr" ] && continue
+          ipset add {{ ipset_name_v6 }} "$cidr" 2>/dev/null || true
+        done < {{ geoip_zone_file_v6 }}
+      args:
+        executable: /bin/bash
+      when:
+        - geoblock_ipv6_mode == "norway"
+        - zone_download_v6.changed or ipset_check_v6.rc != 0
 
     - name: Save ipset to disk
       shell: ipset save > /etc/ipset.conf
@@ -132,9 +184,37 @@
         iptables -A INPUT -j DROP -m comment --comment "Drop non-Norwegian traffic"
       changed_when: true
 
+    # ── ip6tables rules ───────────────────────────────────────────
+    # ip6tables INPUT defaults to ACCEPT. Without these rules every port is
+    # reachable worldwide over IPv6 and the IPv4 geoblock above is meaningless.
+    - name: Apply ip6tables rules atomically
+      ansible.builtin.shell: |
+        ip6tables -F INPUT
+        ip6tables -A INPUT -i lo -j ACCEPT -m comment --comment "Allow loopback"
+        ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT -m comment --comment "Allow established/related"
+        ip6tables -A INPUT -p ipv6-icmp -j ACCEPT -m comment --comment "NDP/PMTUD - IPv6 breaks without this"
+        ip6tables -A INPUT -s fe80::/10 -j ACCEPT -m comment --comment "Link-local (NDP, DHCPv6 client)"
+        {% if geoblock_ipv6_mode == "norway" %}
+        ip6tables -A INPUT -m set --match-set {{ ipset_name_v6 }} src -j ACCEPT -m comment --comment "Allow Norwegian IPv6"
+        {% endif %}
+        ip6tables -A INPUT -j DROP -m comment --comment "Drop remaining inbound IPv6"
+      changed_when: true
+
     - name: Save iptables rules
       ansible.builtin.command: netfilter-persistent save
       changed_when: true
+
+    # ── Fail2Ban recovery ─────────────────────────────────────────
+    # Flushing INPUT above removed Fail2Ban's jump rules into its f2b-* chains.
+    # The chains survive but nothing reaches them, so every ban silently stops
+    # being enforced. Restart Fail2Ban to reinsert them. Deliberately after the
+    # save: the persisted ruleset should be the clean geoblock baseline, and
+    # Fail2Ban rebuilds its own rules from its database on start.
+    - name: Restart Fail2Ban to reinsert its iptables rules
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: restarted
+      when: "'fail2ban' in ansible_facts.packages"
 
     # ── Auto-update cron ──────────────────────────────────────────
     - name: Deploy GeoIP update script
@@ -147,42 +227,51 @@
           #!/bin/bash
           set -euo pipefail
 
-          ZONE_FILE="{{ geoip_zone_file }}"
-          IPSET_NAME="{{ ipset_name }}"
-          TMP_FILE=$(mktemp)
+          # Refreshes an ipset from a freshly downloaded ipdeny zone file.
+          # Args: <set name> <zone url> <zone file> <ipset create options...>
+          refresh_set() {
+            local set_name="$1" url="$2" zone_file="$3"
+            shift 3
+            local tmp_file lines
+            tmp_file=$(mktemp)
 
-          # Download fresh zone data
-          if ! wget -q "{{ geoip_zone_url }}" -O "$TMP_FILE"; then
-            echo "ERROR: Failed to download zone file" >&2
-            rm -f "$TMP_FILE"
-            exit 1
-          fi
+            if ! wget -q "$url" -O "$tmp_file"; then
+              echo "ERROR: Failed to download zone file for $set_name" >&2
+              rm -f "$tmp_file"
+              return 1
+            fi
 
-          # Validate: file should have at least 100 entries
-          LINES=$(wc -l < "$TMP_FILE")
-          if [ "$LINES" -lt 100 ]; then
-            echo "ERROR: Zone file suspiciously small ($LINES lines), aborting" >&2
-            rm -f "$TMP_FILE"
-            exit 1
-          fi
+            # Validate: a truncated or error-page response must never be applied
+            lines=$(wc -l < "$tmp_file")
+            if [ "$lines" -lt 100 ]; then
+              echo "ERROR: $set_name zone file suspiciously small ($lines lines), aborting" >&2
+              rm -f "$tmp_file"
+              return 1
+            fi
 
-          # Swap in new zone file
-          mv "$TMP_FILE" "$ZONE_FILE"
+            mv "$tmp_file" "$zone_file"
 
-          # Rebuild ipset using swap strategy (no downtime)
-          ipset create "${IPSET_NAME}_tmp" hash:net 2>/dev/null || ipset flush "${IPSET_NAME}_tmp"
-          while IFS= read -r cidr; do
-            [ -z "$cidr" ] && continue
-            ipset add "${IPSET_NAME}_tmp" "$cidr" 2>/dev/null || true
-          done < "$ZONE_FILE"
+            # Swap strategy: build alongside the live set, then swap atomically
+            # so no packet is ever matched against a half-populated set.
+            ipset create "${set_name}_tmp" "$@" 2>/dev/null || ipset flush "${set_name}_tmp"
+            while IFS= read -r cidr; do
+              [ -z "$cidr" ] && continue
+              ipset add "${set_name}_tmp" "$cidr" 2>/dev/null || true
+            done < "$zone_file"
 
-          ipset swap "${IPSET_NAME}_tmp" "$IPSET_NAME"
-          ipset destroy "${IPSET_NAME}_tmp"
+            ipset swap "${set_name}_tmp" "$set_name"
+            ipset destroy "${set_name}_tmp"
 
-          # Persist
+            echo "GeoIP updated: $lines Norwegian ranges loaded into $set_name"
+          }
+
+          refresh_set "{{ ipset_name }}" "{{ geoip_zone_url }}" "{{ geoip_zone_file }}" hash:net
+          {% if geoblock_ipv6_mode == "norway" %}
+          refresh_set "{{ ipset_name_v6 }}" "{{ geoip_zone_url_v6 }}" "{{ geoip_zone_file_v6 }}" hash:net family inet6
+          {% endif %}
+
+          # Persist both sets
           ipset save > /etc/ipset.conf
-
-          echo "GeoIP updated: $LINES Norwegian IP ranges loaded"
 
     - name: Schedule weekly GeoIP update
       cron:

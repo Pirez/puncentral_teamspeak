@@ -11,6 +11,13 @@
     ts_admin_password: "{{ lookup('file', '.env') | regex_findall('TS_ADMIN_PASSWORD=(.+)') | first }}"
     ts_password: "{{ lookup('file', '.env') | regex_findall('TS_PASSWORD=(.+)') | first }}"
 
+    # Backups — the sqlite db holds all channels, groups, permissions and
+    # client identities. It is the only unrecoverable state on the host.
+    ts_backup_dir: "/var/backups/teamspeak"
+    ts_backup_retention_days: 14
+    ts_backup_hour: "4"
+    ts_backup_minute: "30"
+
   handlers:
     - name: Restart teamspeak
       ansible.builtin.systemd:
@@ -68,6 +75,7 @@
           - bzip2
           - wget
           - libmariadb3
+          - sqlite3   # consistent hot backups of ts3server.sqlitedb
         state: present
 
     # ── System user ────────────────────────────────────────────────────────────
@@ -143,6 +151,11 @@
         mode: "0640"
         content: |
           serveradmin_password={{ ts_admin_password }}
+          # ServerQuery binds loopback only. It defaults to 0.0.0.0, which UFW
+          # keeps closed — but geoblock.yml accepts all ports from Norwegian
+          # IPs, which would expose 10011 to the whole country behind nothing
+          # but this password. The setup script below connects via 127.0.0.1.
+          query_ip=127.0.0.1
       notify: Restart teamspeak
 
     # ── systemd service ────────────────────────────────────────────────────────
@@ -220,6 +233,12 @@
           send_cmd(s, 'quit')
           s.close()
 
+    - name: Wait for ServerQuery to accept connections on loopback
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 10011
+        timeout: 60
+
     - name: Set virtual server join password via ServerQuery
       ansible.builtin.command:
         cmd: /tmp/ts3_setpw.py
@@ -232,6 +251,67 @@
       ansible.builtin.file:
         path: /tmp/ts3_setpw.py
         state: absent
+
+    # ── Backups ────────────────────────────────────────────────────────────────
+
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ ts_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"   # archives contain the serveradmin password
+
+    - name: Deploy TeamSpeak backup script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/backup-teamspeak.sh
+        owner: root
+        group: root
+        mode: "0750"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+
+          BACKUP_DIR="{{ ts_backup_dir }}"
+          TS_DIR="{{ ts_dir }}"
+          RETENTION_DAYS={{ ts_backup_retention_days }}
+
+          STAMP=$(date +%Y%m%d-%H%M%S)
+          NAME="ts3-$STAMP"
+          WORK=$(mktemp -d)
+          trap 'rm -rf "$WORK"' EXIT
+
+          # sqlite3 .backup snapshots the database consistently while the server
+          # holds it open. A plain cp can capture a torn mid-transaction write.
+          sqlite3 "$TS_DIR/ts3server.sqlitedb" ".backup '$WORK/ts3server.sqlitedb'"
+
+          # Keep the ini alongside it so a restore is self-contained.
+          cp "$TS_DIR/ts3server.ini" "$WORK/ts3server.ini"
+
+          tar -czf "$BACKUP_DIR/$NAME.tar.gz" -C "$WORK" ts3server.sqlitedb ts3server.ini
+          chmod 0600 "$BACKUP_DIR/$NAME.tar.gz"
+
+          find "$BACKUP_DIR" -name 'ts3-*.tar.gz' -type f -mtime "+$RETENTION_DAYS" -delete
+
+          echo "$(date -Iseconds) Backup written: $BACKUP_DIR/$NAME.tar.gz"
+
+    - name: Run backup once to verify it works
+      ansible.builtin.command: /usr/local/bin/backup-teamspeak.sh
+      register: ts_backup_run
+      changed_when: false
+
+    - name: Show backup result
+      ansible.builtin.debug:
+        msg: "{{ ts_backup_run.stdout }}"
+
+    - name: Schedule daily TeamSpeak backup
+      ansible.builtin.cron:
+        name: Backup TeamSpeak database
+        minute: "{{ ts_backup_minute }}"
+        hour: "{{ ts_backup_hour }}"
+        user: root
+        job: /usr/local/bin/backup-teamspeak.sh >> /var/log/teamspeak-backup.log 2>&1
+        state: present
 
     # ── Firewall ───────────────────────────────────────────────────────────────
 

@@ -100,8 +100,9 @@ IP ranges are refreshed weekly via cron (Sunday 03:00). To trigger manually on t
 | Port  | Protocol | Purpose       |
 |-------|----------|---------------|
 | 9987  | UDP      | Voice         |
-| 10011 | TCP      | ServerQuery   |
 | 30033 | TCP      | File transfer |
+
+ServerQuery (10011/TCP) is **not** exposed — it binds `127.0.0.1` only. Reach it via an SSH tunnel if needed.
 
 ## Variables
 
