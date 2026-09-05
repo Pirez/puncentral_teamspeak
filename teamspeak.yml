@@ -11,6 +11,33 @@
     ts_admin_password: "{{ lookup('file', '.env') | regex_findall('TS_ADMIN_PASSWORD=(.+)') | first }}"
     ts_password: "{{ lookup('file', '.env') | regex_findall('TS_PASSWORD=(.+)') | first }}"
 
+    # Virtual server properties, applied via ServerQuery `serveredit` on every run.
+    # Any virtualserver_* property accepted by serveredit can be added here.
+    # codec_encryption_mode: 0 = per-channel, 1 = globally off, 2 = globally on.
+    # Encryption off measurably reduces CPU and latency; only sane on a trusted server.
+    ts_server_settings:
+      virtualserver_name: "PunCentral"
+      virtualserver_maxclients: 32
+      virtualserver_codec_encryption_mode: 0
+      virtualserver_welcomemessage: "Fire in the hole! The bomb has been planted — you have 40 seconds to land a decent pun. Rush B, don't stop punning."
+
+    # Channels created if absent, matched by name. Existing channels are left
+    # alone: channelcreate is not idempotent, so we skip names already present.
+    ts_channels:
+      - Puns
+
+    # Audio quality is a *channel* property, not a server one. Codec values:
+    #   0 Speex Narrowband   1 Speex Wideband   2 Speex Ultra-Wideband
+    #   3 CELT Mono          4 Opus Voice       5 Opus Music
+    # Quality is 0-10. TS3 defaults to Opus Voice at quality 6; 10 is the max.
+    # Opus Voice is speech-optimised, Opus Music is better for streaming audio.
+    # Higher quality raises per-client bandwidth on both server and clients.
+    ts_channel_codec: 4
+    ts_channel_codec_quality: 10
+    # Apply the codec/quality above to every existing channel. Set false if you
+    # tune channels by hand in the client — this overwrites per-channel settings.
+    ts_channel_apply_quality: true
+
     # Backups — the sqlite db holds all channels, groups, permissions and
     # client identities. It is the only unrecoverable state on the host.
     ts_backup_dir: "/var/backups/teamspeak"
@@ -194,17 +221,17 @@
         state: started
         daemon_reload: true
 
-    # ── Virtual server password ────────────────────────────────────────────────
+    # ── Virtual server settings ────────────────────────────────────────────────
 
     - name: Write ServerQuery script to temporary file
       ansible.builtin.copy:
-        dest: /tmp/ts3_setpw.py
+        dest: /tmp/ts3_settings.py
         owner: root
         group: root
         mode: "0700"
         content: |
           #!/usr/bin/env python3
-          import socket, sys, os
+          import socket, sys, os, json, re
 
           s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           s.connect(('127.0.0.1', 10011))
@@ -213,23 +240,73 @@
           def recv_until(sock, marker=b'error id='):
               buf = b''
               while marker not in buf:
-                  buf += sock.recv(4096)
+                  chunk = sock.recv(4096)
+                  if not chunk:
+                      break
+                  buf += chunk
               return buf
 
           def send_cmd(sock, cmd):
               sock.sendall((cmd + '\n').encode())
               resp = recv_until(sock)
               if b'error id=0' not in resp:
-                  print(resp.decode(), file=sys.stderr)
+                  print(f'command failed: {cmd.split(" ")[0]}', file=sys.stderr)
+                  print(resp.decode(errors='replace'), file=sys.stderr)
                   sys.exit(1)
+              return resp.decode(errors='replace')
+
+          # ServerQuery is whitespace-delimited, so every value must be escaped.
+          # Backslash first, or it would double-escape the sequences added after it.
+          ESCAPES = [('\\', r'\\'), ('/', r'\/'), (' ', r'\s'), ('|', r'\p'),
+                     ('\a', r'\a'), ('\b', r'\b'), ('\f', r'\f'),
+                     ('\n', r'\n'), ('\r', r'\r'), ('\t', r'\t'), ('\v', r'\v')]
+
+          def esc(value):
+              out = str(value)
+              for char, repl in ESCAPES:
+                  out = out.replace(char, repl)
+              return out
 
           admin_password = os.environ['TS_ADMIN_PASSWORD']
           server_password = os.environ['TS_PASSWORD']
+          settings = json.loads(os.environ['TS_SERVER_SETTINGS'])
+          channels = json.loads(os.environ['TS_CHANNELS'])
+          codec = os.environ['TS_CHANNEL_CODEC']
+          codec_quality = os.environ['TS_CHANNEL_CODEC_QUALITY']
+          apply_quality = os.environ['TS_CHANNEL_APPLY_QUALITY'] == 'True'
 
           recv_until(s, b'TS3')  # banner
-          send_cmd(s, f'login serveradmin {admin_password}')
+          send_cmd(s, f'login serveradmin {esc(admin_password)}')
           send_cmd(s, 'use 1')
-          send_cmd(s, f'serveredit virtualserver_password={server_password}')
+
+          # Password is kept out of ts_server_settings so it stays sourced from .env.
+          props = dict(settings, virtualserver_password=server_password)
+          pairs = ' '.join(f'{k}={esc(v)}' for k, v in props.items())
+          send_cmd(s, f'serveredit {pairs}')
+
+          # channelcreate fails if the name is taken, so check the list first.
+          # Names come back escaped, so compare in escaped form.
+          existing = set(re.findall(r'channel_name=(\S+)', send_cmd(s, 'channellist')))
+          for name in channels:
+              if esc(name) in existing:
+                  continue
+              # Permanent, or the channel disappears as soon as it empties.
+              send_cmd(s, f'channelcreate channel_name={esc(name)} '
+                          f'channel_flag_permanent=1 '
+                          f'channel_codec={esc(codec)} '
+                          f'channel_codec_quality={esc(codec_quality)}')
+              print(f'created channel: {name}')
+
+          if apply_quality:
+              resp = send_cmd(s, 'channellist')
+              cids = re.findall(r'cid=(\d+)', resp)
+              for cid in cids:
+                  send_cmd(s, f'channeledit cid={cid} '
+                              f'channel_codec={esc(codec)} '
+                              f'channel_codec_quality={esc(codec_quality)}')
+              print(f'applied codec={codec} quality={codec_quality} '
+                    f'to {len(cids)} channel(s)')
+
           send_cmd(s, 'quit')
           s.close()
 
@@ -239,17 +316,28 @@
         port: 10011
         timeout: 60
 
-    - name: Set virtual server join password via ServerQuery
+    - name: Apply virtual server settings and channel audio quality
       ansible.builtin.command:
-        cmd: /tmp/ts3_setpw.py
+        cmd: /tmp/ts3_settings.py
       environment:
         TS_ADMIN_PASSWORD: "{{ ts_admin_password }}"
         TS_PASSWORD: "{{ ts_password }}"
+        TS_SERVER_SETTINGS: "{{ ts_server_settings | to_json }}"
+        TS_CHANNELS: "{{ ts_channels | to_json }}"
+        TS_CHANNEL_CODEC: "{{ ts_channel_codec }}"
+        TS_CHANNEL_CODEC_QUALITY: "{{ ts_channel_codec_quality }}"
+        TS_CHANNEL_APPLY_QUALITY: "{{ ts_channel_apply_quality }}"
+      register: ts_settings_result
       changed_when: false
+
+    - name: Show applied channel quality
+      ansible.builtin.debug:
+        msg: "{{ ts_settings_result.stdout_lines }}"
+      when: ts_settings_result.stdout_lines | length > 0
 
     - name: Remove ServerQuery script temporary file
       ansible.builtin.file:
-        path: /tmp/ts3_setpw.py
+        path: /tmp/ts3_settings.py
         state: absent
 
     # ── Backups ────────────────────────────────────────────────────────────────

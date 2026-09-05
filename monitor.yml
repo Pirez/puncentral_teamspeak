@@ -29,7 +29,9 @@
     fail2ban_admin_ip: ""
     # Set fail2ban_admin_hostname to a hostname that resolves to your IP (e.g. "vpn.bjorgen.co").
     # A cron job will re-resolve it every 15 minutes and update all jails live — no restart needed.
-    fail2ban_admin_hostname: "vpn.bjorgen.co"
+    # Left empty on purpose: admin access is not pinned to one IP. Geoblock already
+    # permits SSH from any Norwegian IP, so connecting from a different address just works.
+    fail2ban_admin_hostname: ""
     # Bantime escalation — doubles ban duration on each repeat offence, up to 4 weeks
     fail2ban_bantime_increment: true
     fail2ban_bantime_factor: 2
